@@ -167,24 +167,20 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     return (m', ast)
 
   countArgs :: M.Map Ident Int -> Expr Ann -> m (Maybe Int)
-  countArgs _ expr@(Abs _ arg val) =
+  countArgs _ expr@Abs{} =
     let getArgs (Abs _ arg' val') = arg':args'
             where args' = getArgs val'
-        getArgs otherThing = []
+        getArgs _ = []
         argCount = length $ getArgs expr
     in return $ Just argCount
-  countArgs m app@(App _ l r) = return $ case unApp app [] of
+  countArgs m app@App{} = return $ case unApp app [] of
     (Var _ (Qualified _ ident), args) -> case M.lookup ident m of
                                           Just argC -> Just (argC - length args)
                                           Nothing -> Nothing
     _ -> Nothing
-    where
-     unApp :: Expr Ann -> [Expr Ann] -> (Expr Ann, [Expr Ann])
-     unApp (App _ val arg) args = unApp val (arg : args)
-     unApp other args = (other, args)
   countArgs m (Let _ bindings expr) = do
-    m' <- foldM (\m binding -> fst <$> bindToJs m binding) m bindings
-    countArgs m' expr
+    m'' <- foldM (\m' binding -> fst <$> bindToJs m' binding) m bindings
+    countArgs m'' expr
   countArgs _ _ = return $ Nothing
 
   withPos :: SourceSpan -> AST -> m AST
@@ -218,9 +214,9 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
   valueToJs' :: M.Map Ident Int -> Expr Ann -> m AST
   valueToJs' m (Literal (pos, _, _, _) l) =
     rethrowWithPosition pos $ literalToValueJS m l
-  valueToJs' m (Var (_, _, _, Just (IsConstructor _ [])) name) =
+  valueToJs' _ (Var (_, _, _, Just (IsConstructor _ [])) name) =
     return $ accessorString "value" $ qualifiedToJS id name
-  valueToJs' m (Var (_, _, _, Just (IsConstructor _ _)) name) =
+  valueToJs' _ (Var (_, _, _, Just (IsConstructor _ _)) name) =
     return $ accessorString "create" $ qualifiedToJS id name
   valueToJs' m (Accessor _ prop val) =
     accessorString prop <$> valueToJs m val
@@ -228,7 +224,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     obj <- valueToJs m o
     sts <- mapM (sndM $ valueToJs m) ps
     extendObj obj sts
-  valueToJs' m e@(Abs (_, _, _, Just IsTypeClassConstructor) _ _) =
+  valueToJs' _ e@(Abs (_, _, _, Just IsTypeClassConstructor) _ _) =
     let args = unAbs e
     in return $ AST.Function Nothing Nothing (map identToJs args) (AST.Block Nothing $ map assign args)
     where
@@ -239,11 +235,11 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     assign name = AST.Assignment Nothing (accessorString (mkString $ runIdent name) (AST.Var Nothing "this"))
                                (var name)
   valueToJs' m (Abs _ arg val) =
-    let fn (Abs _ arg' val') = (arg':args', res)
-            where (args', res) = fn val'
-        fn otherThing = ([], otherThing)
+    let getArgs (Abs _ arg' val') = (arg':args', res)
+            where (args', res) = getArgs val'
+        getArgs otherThing = ([], otherThing)
     in do
-      let (args, val') = fn val
+      let (args, val') = getArgs val
       ret <- valueToJs m val'
       return $ AST.Function Nothing Nothing (map identToJs (arg:args)) (AST.Block Nothing [AST.Return Nothing ret])
   valueToJs' m e@App{} = do
@@ -265,37 +261,31 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
       _ -> do
         ret <- valueToJs m f
         return $ AST.App Nothing ret args'
-    where
-    unApp :: Expr Ann -> [Expr Ann] -> (Expr Ann, [Expr Ann])
-    unApp (App _ val arg) args = unApp val (arg : args)
-    unApp other args = (other, args)
-  valueToJs' m (Var (_, _, _, Just IsForeign) qi@(Qualified (Just mn') ident)) =
+  valueToJs' _ (Var (_, _, _, Just IsForeign) qi@(Qualified (Just mn') ident)) =
     return $ if mn' == mn
              then foreignIdent ident
              else varToJs qi
-  valueToJs' m (Var (_, _, _, Just IsForeign) ident) =
+  valueToJs' _ (Var (_, _, _, Just IsForeign) ident) =
     internalError $ "Encountered an unqualified reference to a foreign ident " ++ T.unpack (showQualified showIdent ident)
-  valueToJs' m (Var _ ident) = return $ varToJs ident
+  valueToJs' _ (Var _ ident) = return $ varToJs ident
   valueToJs' m (Case (ss, _, _, _) values binders) = do
     vals <- mapM (valueToJs m) values
     bindersToJs ss binders vals
   valueToJs' m (Let _ ds val) = do
-    let step (m', asts) val = do
-           (m'', ast) <- bindToJs m' val
-           return $ (m'', ast:asts)
+    let step (m', asts) d = bindToJs m' d >>= return . mapSnd (:asts)
     (m', ds') <- (mapSnd (concat . reverse)) <$> foldM step (m, []) ds
     ret <- valueToJs m' val
     return $ AST.App Nothing (AST.Function Nothing Nothing [] (AST.Block Nothing (ds' ++ [AST.Return Nothing ret]))) []
-  valueToJs' m (Constructor (_, _, _, Just IsNewtype) _ (ProperName ctor) _) =
+  valueToJs' _ (Constructor (_, _, _, Just IsNewtype) _ (ProperName ctor) _) =
     return $ AST.VariableIntroduction Nothing (properToJs ctor) (Just $
                 AST.ObjectLiteral Nothing [("create",
                   AST.Function Nothing Nothing ["value"]
                     (AST.Block Nothing [AST.Return Nothing $ AST.Var Nothing "value"]))])
-  valueToJs' m (Constructor _ _ (ProperName ctor) []) =
+  valueToJs' _ (Constructor _ _ (ProperName ctor) []) =
     return $ iife (properToJs ctor) [ AST.Function Nothing (Just (properToJs ctor)) [] (AST.Block Nothing [])
            , AST.Assignment Nothing (accessorString "value" (AST.Var Nothing (properToJs ctor)))
                 (AST.Unary Nothing AST.New $ AST.App Nothing (AST.Var Nothing (properToJs ctor)) []) ]
-  valueToJs' m (Constructor _ _ (ProperName ctor) fields) =
+  valueToJs' _ (Constructor _ _ (ProperName ctor) fields) =
     let constructor =
           let body = [ AST.Assignment Nothing ((accessorString $ mkString $ identToJs f) (AST.Var Nothing "this")) (var f) | f <- fields ]
           in AST.Function Nothing (Just (properToJs ctor)) (identToJs `map` fields) (AST.Block Nothing body)
@@ -305,6 +295,10 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     in return $ iife (properToJs ctor) [ constructor
                           , AST.Assignment Nothing (accessorString "create" (AST.Var Nothing (properToJs ctor))) createFn
                           ]
+
+  unApp :: Expr Ann -> [Expr Ann] -> (Expr Ann, [Expr Ann])
+  unApp (App _ val arg) args = unApp val (arg : args)
+  unApp other args = (other, args)
 
   iife :: Text -> [AST] -> AST
   iife v exprs = AST.App Nothing (AST.Function Nothing Nothing [] (AST.Block Nothing $ exprs ++ [AST.Return Nothing $ AST.Var Nothing v])) []

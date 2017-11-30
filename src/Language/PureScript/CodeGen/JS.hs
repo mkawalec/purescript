@@ -58,10 +58,10 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     let mnLookup = renameImports usedNames imps
     jsImports <- traverse (importToJs mnLookup) . delete (ModuleName [ProperName C.prim]) . (\\ [mn]) $ ordNub $ map snd imps
     let decls' = renameModules mnLookup decls
-    let step (m', asts) val = do
-                (m'', ast) <- bindToJs m' val
-                return (m'', ast:asts)
+
+    let step (m', asts) val = bindToJs m' val >>= return . mapSnd (:asts)
     jsDecls <- reverse . snd <$> foldM step (M.empty, []) decls'
+
     optimized <- traverse (traverse optimize) jsDecls
     F.traverse_ (F.traverse_ checkIntegers) optimized
     comments <- not <$> asks optionsNoComments

@@ -10,7 +10,7 @@ import Prelude.Compat
 import Protolude (ordNub)
 
 import Control.Arrow ((&&&))
-import Control.Monad (forM, replicateM, void)
+import Control.Monad (forM, foldM, replicateM, void)
 import Control.Monad.Except (MonadError, throwError)
 import Control.Monad.Reader (MonadReader, asks)
 import Control.Monad.Supply.Class
@@ -41,6 +41,8 @@ import Language.PureScript.Traversals (sndM)
 import qualified Language.PureScript.Constants as C
 
 import System.FilePath.Posix ((</>))
+import qualified Debug.Trace as DT
+import qualified Text.Show.Pretty as P
 
 -- | Generate code in the simplified JavaScript intermediate representation for all declarations in a
 -- module.
@@ -56,11 +58,14 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     let mnLookup = renameImports usedNames imps
     jsImports <- traverse (importToJs mnLookup) . delete (ModuleName [ProperName C.prim]) . (\\ [mn]) $ ordNub $ map snd imps
     let decls' = renameModules mnLookup decls
-    jsDecls <- mapM bindToJs decls'
+    let step (m', asts) val = do
+                (m'', ast) <- bindToJs m' val
+                return (m'', ast:asts)
+    jsDecls <- reverse . snd <$> foldM step (M.empty, []) decls'
     optimized <- traverse (traverse optimize) jsDecls
     F.traverse_ (F.traverse_ checkIntegers) optimized
     comments <- not <$> asks optionsNoComments
-    let strict = AST.StringLiteral Nothing "use strict"
+    let strict = DT.traceShow mnLookup $ AST.StringLiteral Nothing "use strict"
     let header = if comments && not (null coms) then AST.Comment Nothing coms strict else strict
     let foreign' = [AST.VariableIntroduction Nothing "$foreign" foreign_ | not $ null foreigns || isNothing foreign_]
     let moduleBody = header : foreign' ++ jsImports ++ concat optimized
@@ -125,26 +130,62 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
       in Qualified (Just mnSafe) a
     renameQual q = q
 
+  mapSnd :: (b -> c) -> (a , b) -> (a, c)
+  mapSnd f (a, b) = (a, f b)
+
   -- |
   -- Generate code in the simplified JavaScript intermediate representation for a declaration
   --
-  bindToJs :: Bind Ann -> m [AST]
-  bindToJs (NonRec ann ident val) = return <$> nonRecToJS ann ident val
-  bindToJs (Rec vals) = forM vals (uncurry . uncurry $ nonRecToJS)
+  bindToJs :: M.Map Ident Int -> Bind Ann -> m (M.Map Ident Int, [AST])
+  bindToJs m (NonRec ann ident val) = do
+    (m', ast) <- nonRecToJS m ann ident val
+    return (m', [ast])
+  bindToJs m (Rec vals) = (mapSnd reverse) <$> foldM step (m, []) vals
+    where step (m', asts) val = do
+                (m'', ast) <- (uncurry . uncurry $ nonRecToJS m') val
+                return (m'', ast:asts)
 
   -- | Generate code in the simplified JavaScript intermediate representation for a single non-recursive
   -- declaration.
   --
   -- The main purpose of this function is to handle code generation for comments.
-  nonRecToJS :: Ann -> Ident -> Expr Ann -> m AST
-  nonRecToJS a i e@(extractAnn -> (_, com, _, _)) | not (null com) = do
+  nonRecToJS :: M.Map Ident Int -> Ann -> Ident -> Expr Ann -> m (M.Map Ident Int, AST)
+  nonRecToJS m a i e@(extractAnn -> (_, com, _, _)) | not (null com) = do
     withoutComment <- asks optionsNoComments
     if withoutComment
-       then nonRecToJS a i (modifyAnn removeComments e)
-       else AST.Comment Nothing com <$> nonRecToJS a i (modifyAnn removeComments e)
-  nonRecToJS (ss, _, _, _) ident val = do
-    js <- valueToJs val
-    withPos ss $ AST.VariableIntroduction Nothing (identToJs ident) (Just js)
+       then nonRecToJS m a i (modifyAnn removeComments e)
+       else do
+         (m', ast) <- nonRecToJS m a i (modifyAnn removeComments e)
+         return (m', AST.Comment Nothing com ast)
+  nonRecToJS m (ss, _, _, _) ident val = do
+    argCount <- countArgs m val
+    let m' = case argCount of
+                Just args -> M.insert ident args m
+                Nothing ->  m
+    js <- valueToJs m' val
+    ast <- withPos ss $ AST.VariableIntroduction Nothing (identToJs ident) (Just js)
+    return (m', ast)
+
+  countArgs :: M.Map Ident Int -> Expr Ann -> m (Maybe Int)
+  countArgs _ expr@(Abs _ arg val) =
+    let getArgs (Abs _ arg' val') = arg':args'
+            where args' = getArgs val'
+        getArgs otherThing = []
+        argCount = length $ getArgs expr
+    in return $ Just argCount
+  countArgs m app@(App _ l r) = return $ case unApp app [] of
+    (Var _ (Qualified _ ident), args) -> case M.lookup ident m of
+                                          Just argC -> Just (argC - length args)
+                                          Nothing -> Nothing
+    _ -> Nothing
+    where
+     unApp :: Expr Ann -> [Expr Ann] -> (Expr Ann, [Expr Ann])
+     unApp (App _ val arg) args = unApp val (arg : args)
+     unApp other args = (other, args)
+  countArgs m (Let _ bindings expr) = do
+    m' <- foldM (\m binding -> fst <$> bindToJs m binding) m bindings
+    countArgs m' expr
+  countArgs _ _ = return $ Nothing
 
   withPos :: SourceSpan -> AST -> m AST
   withPos ss js = do
@@ -169,25 +210,25 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
   accessorString prop = AST.Indexer Nothing (AST.StringLiteral Nothing prop)
 
   -- | Generate code in the simplified JavaScript intermediate representation for a value or expression.
-  valueToJs :: Expr Ann -> m AST
-  valueToJs e =
+  valueToJs :: M.Map Ident Int -> Expr Ann -> m AST
+  valueToJs m e =
     let (ss, _, _, _) = extractAnn e in
-    withPos ss =<< valueToJs' e
+    withPos ss =<< valueToJs' m e
 
-  valueToJs' :: Expr Ann -> m AST
-  valueToJs' (Literal (pos, _, _, _) l) =
-    rethrowWithPosition pos $ literalToValueJS l
-  valueToJs' (Var (_, _, _, Just (IsConstructor _ [])) name) =
+  valueToJs' :: M.Map Ident Int -> Expr Ann -> m AST
+  valueToJs' m (Literal (pos, _, _, _) l) =
+    rethrowWithPosition pos $ literalToValueJS m l
+  valueToJs' m (Var (_, _, _, Just (IsConstructor _ [])) name) =
     return $ accessorString "value" $ qualifiedToJS id name
-  valueToJs' (Var (_, _, _, Just (IsConstructor _ _)) name) =
+  valueToJs' m (Var (_, _, _, Just (IsConstructor _ _)) name) =
     return $ accessorString "create" $ qualifiedToJS id name
-  valueToJs' (Accessor _ prop val) =
-    accessorString prop <$> valueToJs val
-  valueToJs' (ObjectUpdate _ o ps) = do
-    obj <- valueToJs o
-    sts <- mapM (sndM valueToJs) ps
+  valueToJs' m (Accessor _ prop val) =
+    accessorString prop <$> valueToJs m val
+  valueToJs' m (ObjectUpdate _ o ps) = do
+    obj <- valueToJs m o
+    sts <- mapM (sndM $ valueToJs m) ps
     extendObj obj sts
-  valueToJs' e@(Abs (_, _, _, Just IsTypeClassConstructor) _ _) =
+  valueToJs' m e@(Abs (_, _, _, Just IsTypeClassConstructor) _ _) =
     let args = unAbs e
     in return $ AST.Function Nothing Nothing (map identToJs args) (AST.Block Nothing $ map assign args)
     where
@@ -197,47 +238,64 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     assign :: Ident -> AST
     assign name = AST.Assignment Nothing (accessorString (mkString $ runIdent name) (AST.Var Nothing "this"))
                                (var name)
-  valueToJs' (Abs _ arg val) = do
-    ret <- valueToJs val
-    return $ AST.Function Nothing Nothing [identToJs arg] (AST.Block Nothing [AST.Return Nothing ret])
-  valueToJs' e@App{} = do
+  valueToJs' m (Abs _ arg val) =
+    let fn (Abs _ arg' val') = (arg':args', res)
+            where (args', res) = fn val'
+        fn otherThing = ([], otherThing)
+    in do
+      let (args, val') = fn val
+      ret <- valueToJs m val'
+      return $ AST.Function Nothing Nothing (map identToJs (arg:args)) (AST.Block Nothing [AST.Return Nothing ret])
+  valueToJs' m e@App{} = do
     let (f, args) = unApp e []
-    args' <- mapM valueToJs args
+    args' <- mapM (valueToJs m) args
     case f of
       Var (_, _, _, Just IsNewtype) _ -> return (head args')
       Var (_, _, _, Just (IsConstructor _ fields)) name | length args == length fields ->
         return $ AST.Unary Nothing AST.New $ AST.App Nothing (qualifiedToJS id name) args'
       Var (_, _, _, Just IsTypeClassConstructor) name ->
         return $ AST.Unary Nothing AST.New $ AST.App Nothing (qualifiedToJS id name) args'
-      _ -> flip (foldl (\fn a -> AST.App Nothing fn [a])) args' <$> valueToJs f
+      Var _ (Qualified _ ident) -> do
+        ret <- valueToJs m f
+        return $ case M.lookup ident m of
+          Just argCount -> if argCount > length args'
+                            then AST.App Nothing (AST.Indexer Nothing (AST.StringLiteral Nothing $ mkString "bind") ret) ((AST.Var Nothing "null"):args')
+                            else AST.App Nothing ret args'
+          Nothing -> AST.App Nothing ret args'
+      _ -> do
+        ret <- valueToJs m f
+        return $ AST.App Nothing ret args'
     where
     unApp :: Expr Ann -> [Expr Ann] -> (Expr Ann, [Expr Ann])
     unApp (App _ val arg) args = unApp val (arg : args)
     unApp other args = (other, args)
-  valueToJs' (Var (_, _, _, Just IsForeign) qi@(Qualified (Just mn') ident)) =
+  valueToJs' m (Var (_, _, _, Just IsForeign) qi@(Qualified (Just mn') ident)) =
     return $ if mn' == mn
              then foreignIdent ident
              else varToJs qi
-  valueToJs' (Var (_, _, _, Just IsForeign) ident) =
+  valueToJs' m (Var (_, _, _, Just IsForeign) ident) =
     internalError $ "Encountered an unqualified reference to a foreign ident " ++ T.unpack (showQualified showIdent ident)
-  valueToJs' (Var _ ident) = return $ varToJs ident
-  valueToJs' (Case (ss, _, _, _) values binders) = do
-    vals <- mapM valueToJs values
+  valueToJs' m (Var _ ident) = return $ varToJs ident
+  valueToJs' m (Case (ss, _, _, _) values binders) = do
+    vals <- mapM (valueToJs m) values
     bindersToJs ss binders vals
-  valueToJs' (Let _ ds val) = do
-    ds' <- concat <$> mapM bindToJs ds
-    ret <- valueToJs val
+  valueToJs' m (Let _ ds val) = do
+    let step (m', asts) val = do
+           (m'', ast) <- bindToJs m' val
+           return $ (m'', ast:asts)
+    (m', ds') <- (mapSnd (concat . reverse)) <$> foldM step (m, []) ds
+    ret <- valueToJs m' val
     return $ AST.App Nothing (AST.Function Nothing Nothing [] (AST.Block Nothing (ds' ++ [AST.Return Nothing ret]))) []
-  valueToJs' (Constructor (_, _, _, Just IsNewtype) _ (ProperName ctor) _) =
+  valueToJs' m (Constructor (_, _, _, Just IsNewtype) _ (ProperName ctor) _) =
     return $ AST.VariableIntroduction Nothing (properToJs ctor) (Just $
                 AST.ObjectLiteral Nothing [("create",
                   AST.Function Nothing Nothing ["value"]
                     (AST.Block Nothing [AST.Return Nothing $ AST.Var Nothing "value"]))])
-  valueToJs' (Constructor _ _ (ProperName ctor) []) =
+  valueToJs' m (Constructor _ _ (ProperName ctor) []) =
     return $ iife (properToJs ctor) [ AST.Function Nothing (Just (properToJs ctor)) [] (AST.Block Nothing [])
            , AST.Assignment Nothing (accessorString "value" (AST.Var Nothing (properToJs ctor)))
                 (AST.Unary Nothing AST.New $ AST.App Nothing (AST.Var Nothing (properToJs ctor)) []) ]
-  valueToJs' (Constructor _ _ (ProperName ctor) fields) =
+  valueToJs' m (Constructor _ _ (ProperName ctor) fields) =
     let constructor =
           let body = [ AST.Assignment Nothing ((accessorString $ mkString $ identToJs f) (AST.Var Nothing "this")) (var f) | f <- fields ]
           in AST.Function Nothing (Just (properToJs ctor)) (identToJs `map` fields) (AST.Block Nothing body)
@@ -251,14 +309,14 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
   iife :: Text -> [AST] -> AST
   iife v exprs = AST.App Nothing (AST.Function Nothing Nothing [] (AST.Block Nothing $ exprs ++ [AST.Return Nothing $ AST.Var Nothing v])) []
 
-  literalToValueJS :: Literal (Expr Ann) -> m AST
-  literalToValueJS (NumericLiteral (Left i)) = return $ AST.NumericLiteral Nothing (Left i)
-  literalToValueJS (NumericLiteral (Right n)) = return $ AST.NumericLiteral Nothing (Right n)
-  literalToValueJS (StringLiteral s) = return $ AST.StringLiteral Nothing s
-  literalToValueJS (CharLiteral c) = return $ AST.StringLiteral Nothing (fromString [c])
-  literalToValueJS (BooleanLiteral b) = return $ AST.BooleanLiteral Nothing b
-  literalToValueJS (ArrayLiteral xs) = AST.ArrayLiteral Nothing <$> mapM valueToJs xs
-  literalToValueJS (ObjectLiteral ps) = AST.ObjectLiteral Nothing <$> mapM (sndM valueToJs) ps
+  literalToValueJS :: M.Map Ident Int -> Literal (Expr Ann) -> m AST
+  literalToValueJS _ (NumericLiteral (Left i)) = return $ AST.NumericLiteral Nothing (Left i)
+  literalToValueJS _ (NumericLiteral (Right n)) = return $ AST.NumericLiteral Nothing (Right n)
+  literalToValueJS _ (StringLiteral s) = return $ AST.StringLiteral Nothing s
+  literalToValueJS _ (CharLiteral c) = return $ AST.StringLiteral Nothing (fromString [c])
+  literalToValueJS _ (BooleanLiteral b) = return $ AST.BooleanLiteral Nothing b
+  literalToValueJS m (ArrayLiteral xs) = AST.ArrayLiteral Nothing <$> mapM (valueToJs m) xs
+  literalToValueJS m (ObjectLiteral ps) = AST.ObjectLiteral Nothing <$> mapM (sndM $ valueToJs m) ps
 
   -- | Shallow copy an object.
   extendObj :: AST -> [(PSString, AST)] -> m AST
@@ -330,13 +388,13 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
       guardsToJs :: Either [(Guard Ann, Expr Ann)] (Expr Ann) -> m [AST]
       guardsToJs (Left gs) = traverse genGuard gs where
         genGuard (cond, val) = do
-          cond' <- valueToJs cond
-          val'   <- valueToJs val
+          cond' <- valueToJs M.empty cond
+          val'   <- valueToJs M.empty val
           return
             (AST.IfElse Nothing cond'
               (AST.Block Nothing [AST.Return Nothing val']) Nothing)
 
-      guardsToJs (Right v) = return . AST.Return Nothing <$> valueToJs v
+      guardsToJs (Right v) = return . AST.Return Nothing <$> valueToJs M.empty v
 
   binderToJs :: Text -> [AST] -> Binder Ann -> m [AST]
   binderToJs s done binder =

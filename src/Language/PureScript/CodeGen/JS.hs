@@ -62,12 +62,12 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     let decls' = renameModules mnLookup decls
 
     let step (m', asts) val = bindToJs m' val >>= return . mapSnd (:asts)
-    (bindingMap, jsDecls) <- mapSnd reverse <$> foldM step (M.empty, []) decls'
+    (bindingMap, jsDecls) <- DT.trace (P.ppShow decls') $ mapSnd reverse <$> foldM step (M.empty, []) decls'
 
-    optimized <- DT.traceShow bindingMap $ traverse (traverse optimize) jsDecls
+    optimized <- traverse (traverse optimize) jsDecls
     F.traverse_ (F.traverse_ checkIntegers) optimized
     comments <- not <$> asks optionsNoComments
-    let strict = DT.traceShow mnLookup $ AST.StringLiteral Nothing "use strict"
+    let strict = AST.StringLiteral Nothing "use strict"
     let header = if comments && not (null coms) then AST.Comment Nothing coms strict else strict
     let foreign' = [AST.VariableIntroduction Nothing "$foreign" foreign_ | not $ null foreigns || isNothing foreign_]
     let moduleBody = header : foreign' ++ jsImports ++ concat optimized
@@ -268,8 +268,21 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
                             then AST.App Nothing (AST.Indexer Nothing (AST.StringLiteral Nothing $ mkString "bind") ret) ((AST.Var Nothing "null"):args')
                             else AST.App Nothing ret args'
           Nothing -> AST.App Nothing ret args'
+      acc@Accessor{} -> do
+        let unAcc path (Accessor _ key rest) = unAcc (key:path) rest
+            unAcc path (Var _ (Qualified _ ident)) = Just (ident, path)
+            unAcc _ _ = Nothing
+        ret <- DT.trace ("accessor " ++ (show $ unAcc [] acc) ++ " " ++ (show m)) valueToJs m f
+        return $ case unAcc [] acc of
+          Just (ident, path) -> do
+            case M.lookup (Acc ident (reverse path)) m of
+              Just argCount -> if argCount > length args'
+                                then AST.App Nothing (AST.Indexer Nothing (AST.StringLiteral Nothing $ mkString "bind") ret) ((AST.Var Nothing "null"):args')
+                                else AST.App Nothing ret args'
+              Nothing -> AST.App Nothing ret args'
+          Nothing -> AST.App Nothing ret args'
       _ -> do
-        ret <- valueToJs m f
+        ret <- DT.trace ("app " ++ (P.ppShow f)) $ valueToJs m f
         return $ AST.App Nothing ret args'
   valueToJs' _ (Var (_, _, _, Just IsForeign) qi@(Qualified (Just mn') ident)) =
     return $ if mn' == mn

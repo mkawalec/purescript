@@ -44,6 +44,8 @@ import System.FilePath.Posix ((</>))
 import qualified Debug.Trace as DT
 import qualified Text.Show.Pretty as P
 
+data Acc = Acc Ident [PSString] deriving (Eq, Ord, Show)
+
 -- | Generate code in the simplified JavaScript intermediate representation for all declarations in a
 -- module.
 moduleToJs
@@ -60,9 +62,9 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     let decls' = renameModules mnLookup decls
 
     let step (m', asts) val = bindToJs m' val >>= return . mapSnd (:asts)
-    jsDecls <- reverse . snd <$> foldM step (M.empty, []) decls'
+    (bindingMap, jsDecls) <- mapSnd reverse <$> foldM step (M.empty, []) decls'
 
-    optimized <- traverse (traverse optimize) jsDecls
+    optimized <- DT.traceShow bindingMap $ traverse (traverse optimize) jsDecls
     F.traverse_ (F.traverse_ checkIntegers) optimized
     comments <- not <$> asks optionsNoComments
     let strict = DT.traceShow mnLookup $ AST.StringLiteral Nothing "use strict"
@@ -136,7 +138,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
   -- |
   -- Generate code in the simplified JavaScript intermediate representation for a declaration
   --
-  bindToJs :: M.Map Ident Int -> Bind Ann -> m (M.Map Ident Int, [AST])
+  bindToJs :: M.Map Acc Int -> Bind Ann -> m (M.Map Acc Int, [AST])
   bindToJs m (NonRec ann ident val) = do
     (m', ast) <- nonRecToJS m ann ident val
     return (m', [ast])
@@ -149,7 +151,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
   -- declaration.
   --
   -- The main purpose of this function is to handle code generation for comments.
-  nonRecToJS :: M.Map Ident Int -> Ann -> Ident -> Expr Ann -> m (M.Map Ident Int, AST)
+  nonRecToJS :: M.Map Acc Int -> Ann -> Ident -> Expr Ann -> m (M.Map Acc Int, AST)
   nonRecToJS m a i e@(extractAnn -> (_, com, _, _)) | not (null com) = do
     withoutComment <- asks optionsNoComments
     if withoutComment
@@ -158,30 +160,38 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
          (m', ast) <- nonRecToJS m a i (modifyAnn removeComments e)
          return (m', AST.Comment Nothing com ast)
   nonRecToJS m (ss, _, _, _) ident val = do
-    argCount <- countArgs m val
-    let m' = case argCount of
-                Just args -> M.insert ident args m
-                Nothing ->  m
-    js <- valueToJs m' val
+    (argCount, m') <- countArgs m ident [] val
+    let m'' = case argCount of
+                Just args -> M.insert (Acc ident []) args m'
+                Nothing ->  m'
+    js <- valueToJs m'' val
     ast <- withPos ss $ AST.VariableIntroduction Nothing (identToJs ident) (Just js)
-    return (m', ast)
+    return (m'', ast)
 
-  countArgs :: M.Map Ident Int -> Expr Ann -> m (Maybe Int)
-  countArgs _ expr@Abs{} =
+  countArgs :: M.Map Acc Int -> Ident -> [PSString] -> Expr Ann -> m ((Maybe Int), M.Map Acc Int)
+  countArgs m _ _ expr@Abs{} =
     let getArgs (Abs _ arg' val') = arg':args'
             where args' = getArgs val'
         getArgs _ = []
         argCount = length $ getArgs expr
-    in return $ Just argCount
-  countArgs m app@App{} = return $ case unApp app [] of
-    (Var _ (Qualified _ ident), args) -> case M.lookup ident m of
-                                          Just argC -> Just (argC - length args)
-                                          Nothing -> Nothing
-    _ -> Nothing
-  countArgs m (Let _ bindings expr) = do
+    in return $ (Just argCount, m)
+  countArgs m _ _ app@App{} = return $ case unApp app [] of
+    (Var _ (Qualified _ ident), args) -> case M.lookup (Acc ident []) m of
+                                          Just argC -> (Just (argC - length args), m)
+                                          Nothing -> (Nothing, m)
+    _ -> (Nothing, m)
+  countArgs m ident path (Let _ bindings expr) = do
     m'' <- foldM (\m' binding -> fst <$> bindToJs m' binding) m bindings
-    countArgs m'' expr
-  countArgs _ _ = return $ Nothing
+    countArgs m'' ident path expr
+  countArgs m ident path (Literal _ (ObjectLiteral keys)) = do
+    newMap <- foldM (\m' (key, contents) -> do
+      (args, m'') <- countArgs m' ident (key:path) contents
+      let finalMap = case args of
+                      Just argCount -> M.insert (Acc ident (key:path)) argCount m''
+                      Nothing -> m''
+      return finalMap) m keys
+    return $ (Nothing, newMap)
+  countArgs m _ _ _ = return $ (Nothing, m)
 
   withPos :: SourceSpan -> AST -> m AST
   withPos ss js = do
@@ -206,12 +216,12 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
   accessorString prop = AST.Indexer Nothing (AST.StringLiteral Nothing prop)
 
   -- | Generate code in the simplified JavaScript intermediate representation for a value or expression.
-  valueToJs :: M.Map Ident Int -> Expr Ann -> m AST
+  valueToJs :: M.Map Acc Int -> Expr Ann -> m AST
   valueToJs m e =
     let (ss, _, _, _) = extractAnn e in
     withPos ss =<< valueToJs' m e
 
-  valueToJs' :: M.Map Ident Int -> Expr Ann -> m AST
+  valueToJs' :: M.Map Acc Int -> Expr Ann -> m AST
   valueToJs' m (Literal (pos, _, _, _) l) =
     rethrowWithPosition pos $ literalToValueJS m l
   valueToJs' _ (Var (_, _, _, Just (IsConstructor _ [])) name) =
@@ -253,7 +263,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
         return $ AST.Unary Nothing AST.New $ AST.App Nothing (qualifiedToJS id name) args'
       Var _ (Qualified _ ident) -> do
         ret <- valueToJs m f
-        return $ case M.lookup ident m of
+        return $ case M.lookup (Acc ident []) m of
           Just argCount -> if argCount > length args'
                             then AST.App Nothing (AST.Indexer Nothing (AST.StringLiteral Nothing $ mkString "bind") ret) ((AST.Var Nothing "null"):args')
                             else AST.App Nothing ret args'
@@ -303,7 +313,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
   iife :: Text -> [AST] -> AST
   iife v exprs = AST.App Nothing (AST.Function Nothing Nothing [] (AST.Block Nothing $ exprs ++ [AST.Return Nothing $ AST.Var Nothing v])) []
 
-  literalToValueJS :: M.Map Ident Int -> Literal (Expr Ann) -> m AST
+  literalToValueJS :: M.Map Acc Int -> Literal (Expr Ann) -> m AST
   literalToValueJS _ (NumericLiteral (Left i)) = return $ AST.NumericLiteral Nothing (Left i)
   literalToValueJS _ (NumericLiteral (Right n)) = return $ AST.NumericLiteral Nothing (Right n)
   literalToValueJS _ (StringLiteral s) = return $ AST.StringLiteral Nothing s

@@ -62,7 +62,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     let decls' = renameModules mnLookup decls
 
     let step (m', asts) val = bindToJs m' val >>= return . mapSnd (:asts)
-    (bindingMap, jsDecls) <- DT.trace (P.ppShow decls') $ mapSnd reverse <$> foldM step (M.empty, []) decls'
+    (bindingMap, jsDecls) <- mapSnd reverse <$> foldM step (M.empty, []) decls'
 
     optimized <- traverse (traverse optimize) jsDecls
     F.traverse_ (F.traverse_ checkIntegers) optimized
@@ -180,9 +180,10 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
                                           Just argC -> (Just (argC - length args), m)
                                           Nothing -> (Nothing, m)
     _ -> (Nothing, m)
-  countArgs m ident path (Let _ bindings expr) = do
+  countArgs m ident path (Let _ bindings expr) = DT.trace ("let " ++ (P.ppShow expr)) $ do
     m'' <- foldM (\m' binding -> fst <$> bindToJs m' binding) m bindings
     countArgs m'' ident path expr
+  countArgs m ident path (Case _ _ ((CaseAlternative {caseAlternativeResult=(Right res)}):_)) = countArgs m ident path res
   countArgs m ident path (Literal _ (ObjectLiteral keys)) = do
     newMap <- foldM (\m' (key, contents) -> do
       (args, m'') <- countArgs m' ident (key:path) contents
@@ -282,7 +283,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
               Nothing -> AST.App Nothing ret args'
           Nothing -> AST.App Nothing ret args'
       _ -> do
-        ret <- DT.trace ("app " ++ (P.ppShow f)) $ valueToJs m f
+        ret <- valueToJs m f
         return $ AST.App Nothing ret args'
   valueToJs' _ (Var (_, _, _, Just IsForeign) qi@(Qualified (Just mn') ident)) =
     return $ if mn' == mn
@@ -293,7 +294,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
   valueToJs' _ (Var _ ident) = return $ varToJs ident
   valueToJs' m (Case (ss, _, _, _) values binders) = do
     vals <- mapM (valueToJs m) values
-    bindersToJs ss binders vals
+    bindersToJs m ss binders vals
   valueToJs' m (Let _ ds val) = do
     let step (m', asts) d = bindToJs m' d >>= return . mapSnd (:asts)
     (m', ds') <- (mapSnd (concat . reverse)) <$> foldM step (m, []) ds
@@ -373,12 +374,12 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
 
   -- | Generate code in the simplified JavaScript intermediate representation for pattern match binders
   -- and guards.
-  bindersToJs :: SourceSpan -> [CaseAlternative Ann] -> [AST] -> m AST
-  bindersToJs ss binders vals = do
+  bindersToJs :: M.Map Acc Int -> SourceSpan -> [CaseAlternative Ann] -> [AST] -> m AST
+  bindersToJs m ss binders vals = do
     valNames <- replicateM (length vals) freshName
     let assignments = zipWith (AST.VariableIntroduction Nothing) valNames (map Just vals)
     jss <- forM binders $ \(CaseAlternative bs result) -> do
-      ret <- guardsToJs result
+      ret <- guardsToJs m result
       go valNames ret bs
     return $ AST.App Nothing (AST.Function Nothing Nothing [] (AST.Block Nothing (assignments ++ concat jss ++ [AST.Throw Nothing $ failedPatternError valNames])))
                    []
@@ -402,16 +403,16 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
       valueError _ l@(AST.BooleanLiteral _ _) = l
       valueError s _                        = accessorString "name" . accessorString "constructor" $ AST.Var Nothing s
 
-      guardsToJs :: Either [(Guard Ann, Expr Ann)] (Expr Ann) -> m [AST]
-      guardsToJs (Left gs) = traverse genGuard gs where
+      guardsToJs :: M.Map Acc Int -> Either [(Guard Ann, Expr Ann)] (Expr Ann) -> m [AST]
+      guardsToJs m' (Left gs) = traverse genGuard gs where
         genGuard (cond, val) = do
-          cond' <- valueToJs M.empty cond
-          val'   <- valueToJs M.empty val
+          cond' <- valueToJs m' cond
+          val'   <- valueToJs m' val
           return
             (AST.IfElse Nothing cond'
               (AST.Block Nothing [AST.Return Nothing val']) Nothing)
 
-      guardsToJs (Right v) = return . AST.Return Nothing <$> valueToJs M.empty v
+      guardsToJs m' (Right v) = return . AST.Return Nothing <$> valueToJs m' v
 
   binderToJs :: Text -> [AST] -> Binder Ann -> m [AST]
   binderToJs s done binder =

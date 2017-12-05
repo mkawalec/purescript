@@ -116,7 +116,7 @@ moduleFromJSON = withObject "Module" moduleFromObj
     moduleImports <- o .: "imports" >>= listParser (importFromJSON modulePath)
     moduleExports <- o .: "exports" >>= listParser identFromJSON
     moduleDecls <- o .: "decls" >>= listParser (bindFromJSON modulePath)
-    moduleForeign <- o .: "foreign" >>= listParser identFromJSON
+    moduleForeign <- o .: "foreign" >>= parseJSON
     moduleComments <- o .: "comments" >>= listParser parseJSON
     return (version, Module {..})
 

@@ -73,7 +73,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     let header = if comments && not (null coms) then AST.Comment Nothing coms strict else strict
     let foreign' = [AST.VariableIntroduction Nothing "$foreign" foreign_ | not $ null foreigns || isNothing foreign_]
     let moduleBody = header : foreign' ++ jsImports ++ concat optimized
-    let foreignExps = exps `intersect` foreigns
+    let foreignExps = exps `intersect` (map fst foreigns)
     let standardExps = exps \\ foreignExps
     let exps' = AST.ObjectLiteral Nothing $ map (mkString . runIdent &&& AST.Var Nothing . identToJs) standardExps
                                ++ map (mkString . runIdent &&& foreignIdent) foreignExps
@@ -172,7 +172,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     let m'' = case argCount of
                 Just args -> M.insert (Acc ident Nothing []) args m'
                 Nothing ->  m'
-    js <- valueToJs m'' val
+    js <- DT.trace (P.ppShow m'') $ valueToJs m'' val
     ast <- withPos ss $ AST.VariableIntroduction Nothing (identToJs ident) (Just js)
     return (m'', ast)
 

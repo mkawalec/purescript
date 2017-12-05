@@ -6,6 +6,7 @@ import Language.PureScript.Comments
 import Language.PureScript.CoreFn.Expr
 import Language.PureScript.Names
 import Language.PureScript.Externs (Acc)
+import Language.PureScript.Types (Type)
 import qualified Data.Map as M
 
 -- |
@@ -20,6 +21,6 @@ data Module a = Module
   , modulePath :: FilePath
   , moduleImports :: [(a, ModuleName, Maybe (M.Map Acc Int))]
   , moduleExports :: [Ident]
-  , moduleForeign :: [Ident]
+  , moduleForeign :: [(Ident, Type)]
   , moduleDecls :: [Bind a]
   } deriving (Show)

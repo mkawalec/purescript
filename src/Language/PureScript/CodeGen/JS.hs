@@ -31,6 +31,7 @@ import qualified Language.PureScript.CoreImp.AST as AST
 import Language.PureScript.CoreImp.Optimizer
 import Language.PureScript.CoreFn
 import Language.PureScript.Crash
+import Language.PureScript.Externs (Acc(..))
 import Language.PureScript.Errors (ErrorMessageHint(..), SimpleErrorMessage(..),
                                    MultipleErrors(..), rethrow,
                                    errorMessage, rethrowWithPosition, addHint)
@@ -44,8 +45,6 @@ import System.FilePath.Posix ((</>))
 import qualified Debug.Trace as DT
 import qualified Text.Show.Pretty as P
 
-data Acc = Acc Ident [PSString] deriving (Eq, Ord, Show)
-
 -- | Generate code in the simplified JavaScript intermediate representation for all declarations in a
 -- module.
 moduleToJs
@@ -53,7 +52,7 @@ moduleToJs
    . (Monad m, MonadReader Options m, MonadSupply m, MonadError MultipleErrors m)
   => Module Ann
   -> Maybe AST
-  -> m [AST]
+  -> m ([AST], M.Map Acc Int)
 moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
   rethrow (addHint (ErrorInModule mn)) $ do
     let usedNames = concatMap getNames decls
@@ -75,7 +74,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     let standardExps = exps \\ foreignExps
     let exps' = AST.ObjectLiteral Nothing $ map (mkString . runIdent &&& AST.Var Nothing . identToJs) standardExps
                                ++ map (mkString . runIdent &&& foreignIdent) foreignExps
-    return $ moduleBody ++ [AST.Assignment Nothing (accessorString "exports" (AST.Var Nothing "module")) exps']
+    return $ (moduleBody ++ [AST.Assignment Nothing (accessorString "exports" (AST.Var Nothing "module")) exps'], bindingMap)
 
   where
 

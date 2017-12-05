@@ -12,11 +12,13 @@ module Language.PureScript.Externs
   , ExternsDeclaration(..)
   , moduleToExternsFile
   , applyExternsFileToEnvironment
+  , Acc(..)
   ) where
 
 import Prelude.Compat
 
 import Data.Aeson.TH
+import Data.Aeson.Types (FromJSONKey, ToJSONKey)
 import Data.Maybe (fromMaybe, mapMaybe, maybeToList)
 import Data.List (foldl', find)
 import Data.Foldable (fold)
@@ -33,8 +35,15 @@ import Language.PureScript.Kinds
 import Language.PureScript.Names
 import Language.PureScript.TypeClassDictionaries
 import Language.PureScript.Types
+import Language.PureScript.PSString (PSString)
 
 import Paths_purescript as Paths
+
+data Acc = Acc Ident [PSString] deriving (Eq, Ord, Show)
+
+instance FromJSONKey Acc
+instance ToJSONKey Acc
+
 
 -- | The data which will be serialized to an externs file
 data ExternsFile = ExternsFile
@@ -54,6 +63,7 @@ data ExternsFile = ExternsFile
   -- ^ List of type and value declaration
   , efSourceSpan :: SourceSpan
   -- ^ Source span for error reporting
+  , efBindings :: Maybe (M.Map Acc Int)
   } deriving (Show)
 
 -- | A module import in an externs file
@@ -178,6 +188,7 @@ moduleToExternsFile (Module ss _ mn ds (Just exps)) env = ExternsFile{..}
   efTypeFixities  = mapMaybe typeFixityDecl ds
   efDeclarations  = concatMap toExternsDeclaration efExports
   efSourceSpan    = ss
+  efBindings      = Nothing
 
   fixityDecl :: Declaration -> Maybe ExternsFixity
   fixityDecl (ValueFixityDeclaration _ (Fixity assoc prec) name op) =
@@ -231,6 +242,7 @@ moduleToExternsFile (Module ss _ mn ds (Just exps)) env = ExternsFile{..}
     = [ EDKind pn ]
   toExternsDeclaration _ = []
 
+$(deriveJSON (defaultOptions { sumEncoding = ObjectWithSingleField }) ''Acc)
 $(deriveJSON (defaultOptions { sumEncoding = ObjectWithSingleField }) ''ExternsImport)
 $(deriveJSON (defaultOptions { sumEncoding = ObjectWithSingleField }) ''ExternsFixity)
 $(deriveJSON (defaultOptions { sumEncoding = ObjectWithSingleField }) ''ExternsTypeFixity)

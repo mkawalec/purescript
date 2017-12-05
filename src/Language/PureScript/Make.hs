@@ -108,7 +108,7 @@ data MakeActions m = MakeActions
   , readExterns :: ModuleName -> m (FilePath, Externs)
   -- ^ Read the externs file for a module as a string and also return the actual
   -- path for the file.
-  , codegen :: CF.Module CF.Ann -> Environment -> Externs -> SupplyT m ()
+  , codegen :: CF.Module CF.Ann -> Environment -> Externs -> SupplyT m (M.Map Acc Int)
   -- ^ Run the code generator for the module and write any required output files.
   , progress :: ProgressMessage -> m ()
   -- ^ Respond to a progress update.
@@ -154,8 +154,9 @@ rebuildModule MakeActions{..} externs m@(Module _ _ moduleName _ _) = do
       corefn = CF.moduleToCoreFn env' mod'
       [renamed] = renameInModules [corefn]
       exts = moduleToExternsFile mod' env'
-  evalSupplyT nextVar' . codegen renamed env' . encode $ exts
-  return exts
+  evalSupplyT nextVar' $ do
+    bindingsMap <- codegen renamed env' . encode $ exts
+    return $ exts {efBindings=Just bindingsMap}
 
 -- | Compiles in "make" mode, compiling each module separately to a @.js@ file and an @externs.json@ file.
 --
@@ -344,7 +345,7 @@ buildMakeActions outputDir filePathMap foreigns usePrefix =
     let path = outputDir </> T.unpack (runModuleName mn) </> "externs.json"
     (path, ) <$> readTextFile path
 
-  codegen :: CF.Module CF.Ann -> Environment -> Externs -> SupplyT Make ()
+  codegen :: CF.Module CF.Ann -> Environment -> Externs -> SupplyT Make (M.Map Acc Int)
   codegen m _ exts = do
     let mn = CF.moduleName m
     foreignInclude <- case mn `M.lookup` foreigns of
@@ -357,7 +358,7 @@ buildMakeActions outputDir filePathMap foreigns usePrefix =
             return $ Just $ Imp.App Nothing (Imp.Var Nothing "require") [Imp.StringLiteral Nothing "./foreign"]
       Nothing | requiresForeign m -> throwError . errorMessage $ MissingFFIModule mn
               | otherwise -> return Nothing
-    rawJs <- J.moduleToJs m foreignInclude
+    (rawJs, bindingsMap) <- J.moduleToJs m foreignInclude
     dir <- lift $ makeIO (const (ErrorMessage [] $ CannotGetFileInfo ".")) getCurrentDirectory
     sourceMaps <- lift $ asks optionsSourceMaps
     let (pjs, mappings) = if sourceMaps then prettyPrintJSWithSourceMaps rawJs else (prettyPrintJS rawJs, [])
@@ -379,6 +380,7 @@ buildMakeActions outputDir filePathMap foreigns usePrefix =
       let coreFnFile = outputDir </> filePath </> "corefn.json"
       let json = CFJ.moduleToJSON Paths.version m
       lift $ writeTextFile coreFnFile (encode json)
+    return bindingsMap
 
   genSourceMap :: String -> String -> Int -> [SMap] -> Make ()
   genSourceMap dir mapFile extraLines mappings = do

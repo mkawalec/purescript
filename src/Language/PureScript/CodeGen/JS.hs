@@ -10,6 +10,7 @@ import Prelude.Compat
 import Protolude (ordNub)
 
 import Control.Arrow ((&&&))
+import Control.Applicative ((<|>))
 import Control.Monad (forM, foldM, replicateM, void)
 import Control.Monad.Except (MonadError, throwError)
 import Control.Monad.Reader (MonadReader, asks)
@@ -271,7 +272,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
         return $ AST.Unary Nothing AST.New $ AST.App Nothing (qualifiedToJS id name) args'
       Var _ (Qualified mod' ident) -> do
         ret <- valueToJs m f
-        return $ case M.lookup (Acc ident mod' []) m of
+        return $ case (M.lookup (Acc ident mod' []) m) <|> (M.lookup (Acc ident Nothing []) m) of
           Just argCount -> if argCount > length args'
                             then AST.App Nothing (AST.Indexer Nothing (AST.StringLiteral Nothing $ mkString "bind") ret) ((AST.Var Nothing "null"):args')
                             else AST.App Nothing ret args'
@@ -283,7 +284,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
         ret <- valueToJs m f
         return $ case unAcc [] acc of
           Just (ident, mod'', path) -> do
-            case M.lookup (Acc ident mod'' (reverse path)) m of
+            case (M.lookup (Acc ident mod'' (reverse path)) m) <|> (M.lookup (Acc ident Nothing (reverse path)) m) of
               Just argCount -> if argCount > length args'
                                 then AST.App Nothing (AST.Indexer Nothing (AST.StringLiteral Nothing $ mkString "bind") ret) ((AST.Var Nothing "null"):args')
                                 else AST.App Nothing ret args'

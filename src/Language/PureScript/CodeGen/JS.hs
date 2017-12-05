@@ -57,11 +57,13 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
   rethrow (addHint (ErrorInModule mn)) $ do
     let usedNames = concatMap getNames decls
     let mnLookup = renameImports usedNames imps
-    jsImports <- traverse (importToJs mnLookup) . delete (ModuleName [ProperName C.prim]) . (\\ [mn]) $ ordNub $ map snd imps
+    jsImports <- traverse (importToJs mnLookup) . delete (ModuleName [ProperName C.prim]) . (\\ [mn]) $ ordNub $ map (\(_,a,_) -> a) imps
     let decls' = renameModules mnLookup decls
 
+    let bindings = F.foldl' bringImportIntoScope M.empty (map (\(_, a, b) -> (a, b)) imps)
+
     let step (m', asts) val = bindToJs m' val >>= return . mapSnd (:asts)
-    (bindingMap, jsDecls) <- mapSnd reverse <$> foldM step (M.empty, []) decls'
+    (bindingMap, jsDecls) <- mapSnd reverse <$> foldM step (bindings, []) decls'
 
     optimized <- traverse (traverse optimize) jsDecls
     F.traverse_ (F.traverse_ checkIntegers) optimized
@@ -78,6 +80,12 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
 
   where
 
+  bringImportIntoScope :: M.Map Acc Int -> (ModuleName, Maybe (M.Map Acc Int)) -> M.Map Acc Int
+  bringImportIntoScope m (_, Nothing) = m
+  bringImportIntoScope m (moduleName, Just bindingMap) =
+      m `M.union` (M.fromList . map newName . M.toList $ bindingMap)
+    where newName ((Acc ident _ path), argCount) = (Acc ident (Just moduleName) path, argCount)
+
   -- | Extracts all declaration names from a binding group.
   getNames :: Bind Ann -> [Ident]
   getNames (NonRec _ ident _) = [ident]
@@ -85,16 +93,16 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
 
   -- | Creates alternative names for each module to ensure they don't collide
   -- with declaration names.
-  renameImports :: [Ident] -> [(Ann, ModuleName)] -> M.Map ModuleName (Ann, ModuleName)
+  renameImports :: [Ident] -> [(Ann, ModuleName, Maybe (M.Map Acc Int))] -> M.Map ModuleName (Ann, ModuleName, Maybe (M.Map Acc Int))
   renameImports = go M.empty
     where
-    go :: M.Map ModuleName (Ann, ModuleName) -> [Ident] -> [(Ann, ModuleName)] -> M.Map ModuleName (Ann, ModuleName)
-    go acc used ((ann, mn') : mns') =
+    go :: M.Map ModuleName (Ann, ModuleName, Maybe (M.Map Acc Int)) -> [Ident] -> [(Ann, ModuleName, Maybe (M.Map Acc Int))] -> M.Map ModuleName (Ann, ModuleName, Maybe (M.Map Acc Int))
+    go acc used ((ann, mn', bindings) : mns') =
       let mni = Ident $ runModuleName mn'
       in if mn' /= mn && mni `elem` used
          then let newName = freshModuleName 1 mn' used
-              in go (M.insert mn' (ann, newName) acc) (Ident (runModuleName newName) : used) mns'
-         else go (M.insert mn' (ann, mn') acc) used mns'
+              in go (M.insert mn' (ann, newName, bindings) acc) (Ident (runModuleName newName) : used) mns'
+         else go (M.insert mn' (ann, mn', bindings) acc) used mns'
     go acc _ [] = acc
 
     freshModuleName :: Integer -> ModuleName -> [Ident] -> ModuleName
@@ -106,15 +114,15 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
 
   -- | Generates JavaScript code for a module import, binding the required module
   -- to the alternative
-  importToJs :: M.Map ModuleName (Ann, ModuleName) -> ModuleName -> m AST
+  importToJs :: M.Map ModuleName (Ann, ModuleName, Maybe (M.Map Acc Int)) -> ModuleName -> m AST
   importToJs mnLookup mn' = do
-    let ((ss, _, _, _), mnSafe) = fromMaybe (internalError "Missing value in mnLookup") $ M.lookup mn' mnLookup
+    let ((ss, _, _, _), mnSafe, _) = fromMaybe (internalError "Missing value in mnLookup") $ M.lookup mn' mnLookup
     let moduleBody = AST.App Nothing (AST.Var Nothing "require") [AST.StringLiteral Nothing (fromString (".." </> T.unpack (runModuleName mn')))]
     withPos ss $ AST.VariableIntroduction Nothing (moduleNameToJs mnSafe) (Just moduleBody)
 
   -- | Replaces the `ModuleName`s in the AST so that the generated code refers to
   -- the collision-avoiding renamed module imports.
-  renameModules :: M.Map ModuleName (Ann, ModuleName) -> [Bind Ann] -> [Bind Ann]
+  renameModules :: M.Map ModuleName (Ann, ModuleName, Maybe (M.Map Acc Int)) -> [Bind Ann] -> [Bind Ann]
   renameModules mnLookup binds =
     let (f, _, _) = everywhereOnValues id goExpr goBinder
     in map f binds
@@ -127,7 +135,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     goBinder b = b
     renameQual :: Qualified a -> Qualified a
     renameQual (Qualified (Just mn') a) =
-      let (_,mnSafe) = fromMaybe (internalError "Missing value in mnLookup") $ M.lookup mn' mnLookup
+      let (_,mnSafe,_) = fromMaybe (internalError "Missing value in mnLookup") $ M.lookup mn' mnLookup
       in Qualified (Just mnSafe) a
     renameQual q = q
 
@@ -161,7 +169,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
   nonRecToJS m (ss, _, _, _) ident val = do
     (argCount, m') <- countArgs m ident [] val
     let m'' = case argCount of
-                Just args -> M.insert (Acc ident []) args m'
+                Just args -> M.insert (Acc ident Nothing []) args m'
                 Nothing ->  m'
     js <- valueToJs m'' val
     ast <- withPos ss $ AST.VariableIntroduction Nothing (identToJs ident) (Just js)
@@ -175,11 +183,11 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
         argCount = length $ getArgs expr
     in return $ (Just argCount, m)
   countArgs m _ _ app@App{} = return $ case unApp app [] of
-    (Var _ (Qualified _ ident), args) -> case M.lookup (Acc ident []) m of
+    (Var _ (Qualified _ ident), args) -> case M.lookup (Acc ident Nothing []) m of
                                           Just argC -> (Just (argC - length args), m)
                                           Nothing -> (Nothing, m)
     _ -> (Nothing, m)
-  countArgs m ident path (Let _ bindings expr) = DT.trace ("let " ++ (P.ppShow expr)) $ do
+  countArgs m ident path (Let _ bindings expr) = do
     m'' <- foldM (\m' binding -> fst <$> bindToJs m' binding) m bindings
     countArgs m'' ident path expr
   countArgs m ident path (Case _ _ ((CaseAlternative {caseAlternativeResult=(Right res)}):_)) = countArgs m ident path res
@@ -187,7 +195,7 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     newMap <- foldM (\m' (key, contents) -> do
       (args, m'') <- countArgs m' ident (key:path) contents
       let finalMap = case args of
-                      Just argCount -> M.insert (Acc ident (key:path)) argCount m''
+                      Just argCount -> M.insert (Acc ident Nothing (key:path)) argCount m''
                       Nothing -> m''
       return finalMap) m keys
     return $ (Nothing, newMap)
@@ -261,21 +269,21 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
         return $ AST.Unary Nothing AST.New $ AST.App Nothing (qualifiedToJS id name) args'
       Var (_, _, _, Just IsTypeClassConstructor) name ->
         return $ AST.Unary Nothing AST.New $ AST.App Nothing (qualifiedToJS id name) args'
-      Var _ (Qualified _ ident) -> do
+      Var _ (Qualified mod' ident) -> do
         ret <- valueToJs m f
-        return $ case M.lookup (Acc ident []) m of
+        return $ case M.lookup (Acc ident mod' []) m of
           Just argCount -> if argCount > length args'
                             then AST.App Nothing (AST.Indexer Nothing (AST.StringLiteral Nothing $ mkString "bind") ret) ((AST.Var Nothing "null"):args')
                             else AST.App Nothing ret args'
           Nothing -> AST.App Nothing ret args'
       acc@Accessor{} -> do
         let unAcc path (Accessor _ key rest) = unAcc (key:path) rest
-            unAcc path (Var _ (Qualified _ ident)) = Just (ident, path)
+            unAcc path (Var _ (Qualified mod' ident)) = Just (ident, mod', path)
             unAcc _ _ = Nothing
-        ret <- DT.trace ("accessor " ++ (show $ unAcc [] acc) ++ " " ++ (show m)) valueToJs m f
+        ret <- valueToJs m f
         return $ case unAcc [] acc of
-          Just (ident, path) -> do
-            case M.lookup (Acc ident (reverse path)) m of
+          Just (ident, mod'', path) -> do
+            case M.lookup (Acc ident mod'' (reverse path)) m of
               Just argCount -> if argCount > length args'
                                 then AST.App Nothing (AST.Indexer Nothing (AST.StringLiteral Nothing $ mkString "bind") ret) ((AST.Var Nothing "null"):args')
                                 else AST.App Nothing ret args'

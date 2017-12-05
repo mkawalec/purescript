@@ -114,9 +114,10 @@ moduleToJSON v m = object
   ]
 
   where
-  importToJSON (ann,mn) = object
+  importToJSON (ann,mn,bindings) = object
     [ T.pack "annotation" .= annToJSON ann
     , T.pack "moduleName" .= moduleNameToJSON mn
+    , T.pack "bindings"   .= toJSON bindings
     ]
 
 bindToJSON :: Bind Ann -> Value
@@ -183,7 +184,7 @@ exprToJSON (Case ann ss cs)         = object [ T.pack "type"        .= "Case"
                                              , T.pack "caseAlternatives"
                                                                     .= map caseAlternativeToJSON cs
                                              ]
-exprToJSON (Let ann bs e)           = object [ T.pack "type"        .= "Let" 
+exprToJSON (Let ann bs e)           = object [ T.pack "type"        .= "Let"
                                              , T.pack "annotation"  .= annToJSON ann
                                              , T.pack "binds"       .= map bindToJSON bs
                                              , T.pack "expression"  .= exprToJSON e

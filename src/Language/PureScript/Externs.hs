@@ -39,7 +39,7 @@ import Language.PureScript.PSString (PSString)
 
 import Paths_purescript as Paths
 
-data Acc = Acc Ident [PSString] deriving (Eq, Ord, Show)
+data Acc = Acc Ident (Maybe ModuleName) [PSString] deriving (Eq, Ord, Show)
 
 instance FromJSONKey Acc
 instance ToJSONKey Acc

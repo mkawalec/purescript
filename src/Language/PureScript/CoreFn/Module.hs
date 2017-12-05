@@ -5,6 +5,8 @@ import Prelude.Compat
 import Language.PureScript.Comments
 import Language.PureScript.CoreFn.Expr
 import Language.PureScript.Names
+import Language.PureScript.Externs (Acc)
+import qualified Data.Map as M
 
 -- |
 -- The CoreFn module representation
@@ -16,7 +18,7 @@ data Module a = Module
   { moduleComments :: [Comment]
   , moduleName :: ModuleName
   , modulePath :: FilePath
-  , moduleImports :: [(a, ModuleName)]
+  , moduleImports :: [(a, ModuleName, Maybe (M.Map Acc Int))]
   , moduleExports :: [Ident]
   , moduleForeign :: [Ident]
   , moduleDecls :: [Bind a]

@@ -14,12 +14,14 @@ import           Data.Text (Text)
 import qualified Data.Text as T
 import           Text.ParserCombinators.ReadP (readP_to_S)
 import qualified Data.Vector as V
+import qualified Data.Map as M
 import           Data.Version (Version, parseVersion)
 
 import           Language.PureScript.AST.SourcePos (SourceSpan(SourceSpan))
 import           Language.PureScript.AST.Literals
 import           Language.PureScript.CoreFn.Ann
 import           Language.PureScript.CoreFn
+import           Language.PureScript.Externs (Acc(..))
 import           Language.PureScript.Names
 import           Language.PureScript.PSString (PSString)
 
@@ -124,12 +126,13 @@ moduleFromJSON = withObject "Module" moduleFromObj
       (r, _) : _ -> return r
       _ -> fail "failed parsing purs version"
 
-  importFromJSON :: FilePath -> Value -> Parser (Ann, ModuleName)
+  importFromJSON :: FilePath -> Value -> Parser (Ann, ModuleName, Maybe (M.Map Acc Int))
   importFromJSON modulePath = withObject "Import"
     (\o -> do
       ann <- o .: "annotation" >>= annFromJSON modulePath
       mn  <- o .: "moduleName" >>= moduleNameFromJSON
-      return (ann, mn))
+      bd <- o .: "bindings" >>= parseJSON
+      return (ann, mn, bd))
 
 bindFromJSON :: FilePath -> Value -> Parser (Bind Ann)
 bindFromJSON modulePath = withObject "Bind" bindFromObj
@@ -141,7 +144,7 @@ bindFromJSON modulePath = withObject "Bind" bindFromObj
       "NonRec"  -> (uncurry . uncurry) NonRec <$> bindFromObj' o
       "Rec"     -> Rec <$> (o .: "binds" >>= listParser (withObject "Bind" bindFromObj'))
       _         -> fail ("not recognized bind type \"" ++ T.unpack type_ ++ "\"")
-        
+
   bindFromObj' :: Object -> Parser ((Ann, Ident), Expr Ann)
   bindFromObj' o = do
     a <- o .: "annotation" >>= annFromJSON modulePath

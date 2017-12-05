@@ -23,25 +23,43 @@ import Language.PureScript.CoreFn.Meta
 import Language.PureScript.CoreFn.Module
 import Language.PureScript.Crash
 import Language.PureScript.Environment
+import Language.PureScript.Externs (Acc(..))
 import Language.PureScript.Names
 import Language.PureScript.Sugar.TypeClasses (typeClassMemberName, superClassDictionaryNames)
 import Language.PureScript.Types
 import Language.PureScript.PSString (mkString)
 import qualified Language.PureScript.AST as A
+import qualified Data.Set as S
+
+import qualified Debug.Trace as DT
+import qualified Text.Show.Pretty as P
 
 -- | Desugars a module from AST to CoreFn representation.
-moduleToCoreFn :: Environment -> A.Module -> Module Ann
-moduleToCoreFn _ (A.Module _ _ _ _ Nothing) =
+moduleToCoreFn :: Environment -> A.Module -> [M.Map Acc Int] -> Module Ann
+moduleToCoreFn _ (A.Module _ _ _ _ Nothing) _ =
   internalError "Module exports were not elaborated before moduleToCoreFn"
-moduleToCoreFn env (A.Module modSS coms mn decls (Just exps)) =
+moduleToCoreFn env (A.Module modSS coms mn decls (Just exps)) defs =
   let imports = mapMaybe importToCoreFn decls ++ fmap (ssAnn modSS,) (findQualModules decls)
       imports' = dedupeImports imports
+      imports'' = getFullImports imports' $ importsMap (importNames S.empty imports) defs
       exps' = ordNub $ concatMap exportToCoreFn exps
       externs = ordNub $ mapMaybe externToCoreFn decls
       decls' = concatMap declToCoreFn decls
-  in Module coms mn (spanName modSS) imports' exps' externs decls'
+  in Module coms mn (spanName modSS) imports'' exps' externs decls'
 
   where
+
+  importNames :: S.Set ModuleName -> [(Ann, ModuleName)] -> [ModuleName]
+  importNames curr ((_,name):xs) = case S.member name curr of
+    True -> importNames curr xs
+    False -> name:(importNames (S.insert name curr) xs)
+  importNames _ [] = []
+
+  getFullImports :: [(Ann, ModuleName)] -> M.Map ModuleName (M.Map Acc Int) -> [(Ann, ModuleName, Maybe (M.Map Acc Int))]
+  getFullImports imports bindingMap = fmap (\(ann, name) -> (ann, name, M.lookup name bindingMap)) imports
+
+  importsMap :: [ModuleName] -> [M.Map Acc Int] -> M.Map ModuleName (M.Map Acc Int)
+  importsMap imports bindings = M.fromListWith const $ zip imports (M.empty:bindings)
 
   -- | Remove duplicate imports
   dedupeImports :: [(Ann, ModuleName)] -> [(Ann, ModuleName)]

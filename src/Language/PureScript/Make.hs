@@ -78,6 +78,7 @@ import           System.Directory (doesFileExist, getModificationTime, createDir
 import           System.FilePath ((</>), takeDirectory, makeRelative, splitPath, normalise, replaceExtension)
 import           System.IO.Error (tryIOError)
 import qualified Text.Parsec as Parsec
+import qualified Debug.Trace as DT
 
 -- | Progress messages from the make process
 data ProgressMessage
@@ -151,7 +152,7 @@ rebuildModule MakeActions{..} externs m@(Module _ _ moduleName _ _) = do
 
   regrouped <- createBindingGroups moduleName . collapseBindingGroups $ deguarded
   let mod' = Module ss coms moduleName regrouped exps
-      corefn = CF.moduleToCoreFn env' mod'
+      corefn = CF.moduleToCoreFn env' mod' (map (fromMaybe M.empty . efBindings) externs)
       [renamed] = renameInModules [corefn]
       exts = moduleToExternsFile mod' env'
   evalSupplyT nextVar' $ do

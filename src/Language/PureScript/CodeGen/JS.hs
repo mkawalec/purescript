@@ -40,6 +40,7 @@ import Language.PureScript.Names
 import Language.PureScript.Options
 import Language.PureScript.PSString (PSString, mkString)
 import Language.PureScript.Traversals (sndM)
+import Language.PureScript.Types (Type(..))
 import qualified Language.PureScript.Constants as C
 
 import System.FilePath.Posix ((</>))
@@ -62,11 +63,12 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     let decls' = renameModules mnLookup decls
 
     let bindings = F.foldl' bringImportIntoScope M.empty (map (\(_, a, b) -> (a, b)) imps)
+        bindings' = F.foldl' foreignArity bindings foreigns
 
     let step (m', asts) val = bindToJs m' val >>= return . mapSnd (:asts)
-    (bindingMap, jsDecls) <- mapSnd reverse <$> foldM step (bindings, []) decls'
+    (bindingMap, jsDecls) <- mapSnd reverse <$> foldM step (bindings', []) decls'
 
-    optimized <- traverse (traverse optimize) jsDecls
+    let optimized = jsDecls -- <- {-DT.trace (P.ppShow jsDecls) $-} traverse (traverse optimize) jsDecls
     F.traverse_ (F.traverse_ checkIntegers) optimized
     comments <- not <$> asks optionsNoComments
     let strict = AST.StringLiteral Nothing "use strict"
@@ -80,6 +82,11 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     return $ (moduleBody ++ [AST.Assignment Nothing (accessorString "exports" (AST.Var Nothing "module")) exps'], bindingMap)
 
   where
+
+  foreignArity :: M.Map Acc Int -> (Ident, Type) -> M.Map Acc Int
+  foreignArity m (ident, expr) = {-DT.trace (P.ppShow expr) $-} case argCountFromType expr of
+    0 -> m
+    count -> M.insert (Acc ident Nothing []) count m
 
   bringImportIntoScope :: M.Map Acc Int -> (ModuleName, Maybe (M.Map Acc Int)) -> M.Map Acc Int
   bringImportIntoScope m (_, Nothing) = m
@@ -172,22 +179,27 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
     let m'' = case argCount of
                 Just args -> M.insert (Acc ident Nothing []) args m'
                 Nothing ->  m'
-    js <- DT.trace (P.ppShow m'') $ valueToJs m'' val
+    js <- valueToJs m'' val
     ast <- withPos ss $ AST.VariableIntroduction Nothing (identToJs ident) (Just js)
     return (m'', ast)
 
   countArgs :: M.Map Acc Int -> Ident -> [PSString] -> Expr Ann -> m ((Maybe Int), M.Map Acc Int)
-  countArgs m _ _ expr@Abs{} =
-    let getArgs (Abs _ arg' val') = arg':args'
+  countArgs m _ _ (Abs (_, _, Just appType, _) _ _) = return $ case argCountFromType appType of
+     0     -> (Nothing, m)
+     count -> (Just count, m)
+    {-let getArgs (Abs _ arg' val') = arg':args'
             where args' = getArgs val'
         getArgs _ = []
         argCount = length $ getArgs expr
-    in return $ (Just argCount, m)
-  countArgs m _ _ app@App{} = return $ case unApp app [] of
+    in return $ (Just argCount, m)-}
+  countArgs m _ _ (App (_, _, Just appType, _) _ _) = return $ case argCountFromType appType of
+     0     -> (Nothing, m)
+     count -> (Just count, m)
+    {-return $ case unApp app [] of
     (Var _ (Qualified _ ident), args) -> case M.lookup (Acc ident Nothing []) m of
                                           Just argC -> (Just (argC - length args), m)
                                           Nothing -> (Nothing, m)
-    _ -> (Nothing, m)
+    _ -> (Nothing, m)-}
   countArgs m ident path (Let _ bindings expr) = do
     m'' <- foldM (\m' binding -> fst <$> bindToJs m' binding) m bindings
     countArgs m'' ident path expr
@@ -201,6 +213,17 @@ moduleToJs (Module coms mn _ imps exps foreigns decls) foreign_ =
       return finalMap) m keys
     return $ (Nothing, newMap)
   countArgs m _ _ _ = return $ (Nothing, m)
+
+  -- For the app case, count the args from type
+  argCountFromType :: Type -> Int
+  argCountFromType (ForAll _ expr _) = argCountFromType expr
+  argCountFromType (TypeApp (TypeConstructor _) (TypeConstructor _)) = 1
+  argCountFromType (TypeApp (TypeConstructor _) (Skolem _ _ _ _)) = 1
+  argCountFromType (TypeApp (TypeConstructor _) (ConstrainedType _ _)) = 1
+  argCountFromType (TypeApp a@TypeApp{} b@TypeApp{}) = argCountFromType a + argCountFromType b
+  argCountFromType (TypeApp a@TypeApp{} _) = argCountFromType a
+  argCountFromType (TypeApp _ a@TypeApp{}) = argCountFromType a
+  argCountFromType _ = 0
 
   withPos :: SourceSpan -> AST -> m AST
   withPos ss js = do
